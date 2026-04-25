@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lumina</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background-color: #050505;
+      color: #fff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    video {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+      z-index: 1;
+    }
+    
+    /* Mirror output canvas where physics/trails go */
+    #output_canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+      z-index: 2;
+      mix-blend-mode: screen;
+      pointer-events: none;
+    }
+
+    /* Permanent paint layer */
+    #paint_canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+      z-index: 3;
+      mix-blend-mode: screen;
+      pointer-events: none;
+    }
+    
+    #ui {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 15px 20px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    h1 { margin: 0 0 10px 0; font-size: 20px; letter-spacing: 1px; color: #0ff; text-shadow: 0 0 10px #0ff; }
+    p { margin: 0 0 10px 0; font-size: 14px; opacity: 0.8; }
+    
+    #clear_btn {
+      background: rgba(0, 255, 255, 0.1);
+      border: 1px solid #0ff;
+      color: #0ff;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      transition: all 0.2s;
+    }
+    #clear_btn:hover {
+      background: rgba(0, 255, 255, 0.3);
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
+    }
+    
+  </style>
+  
+  <!-- MediaPipe dependencies -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="ui">
+    <h1>Lumina</h1>
+    <p id="status">Loading Camera & Models...</p>
+    <button id="clear_btn">Clear Ink</button>
+  </div>
+
+  <video id="input_video" autoplay playsinline></video>
+  <canvas id="output_canvas"></canvas>
+  <canvas id="paint_canvas"></canvas>
+
+  <script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    
+    // Setup persistent paint canvas
+    const paintCanvas = document.getElementById('paint_canvas');
+    const paintCtx = paintCanvas.getContext('2d');
+
+    const statusText = document.getElementById('status');
+    const clearBtn = document.getElementById('clear_btn');
+
+    let cw = window.innerWidth;
+    let ch = window.innerHeight;
+    canvasElement.width = cw;
+    canvasElement.height = ch;
+    paintCanvas.width = cw;
+    paintCanvas.height = ch;
+
+    // Handle Resize whilst keeping ink
+    window.addEventListener('resize', () => {
+      cw = window.innerWidth;
+      ch = window.innerHeight;
+      canvasElement.width = cw;
+      canvasElement.height = ch;
+      
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = paintCanvas.width;
+      tempCanvas.height = paintCanvas.height;
+      tempCanvas.getContext('2d').drawImage(paintCanvas, 0, 0);
+
+      paintCanvas.width = cw;
+      paintCanvas.height = ch;
+      paintCtx.drawImage(tempCanvas, 0, 0);
+    });
+
+    clearBtn.addEventListener('click', () => {
+       paintCtx.clearRect(0, 0, paintCanvas.width, paintCanvas.height);
+    });
+
+    const NEON_COLORS = ['#00ffff', '#ff00ff', '#39ff14']; // Cyan, Magenta, Lime
+
+    // Physics constants
+    const STIFFNESS = 0.45;
+    const DAMPING = 0.70;
+
+    class PhysicsPoint {
+      constructor(x, y) {
+        this.px = x; 
+        this.py = y; 
+        this.x = x;  
+        this.y = y;  
+        this.vx = 0;
+        this.vy = 0;
+        this.mass = 1;
+      }
+
+      updateTarget(tx, ty) {
+        this.px = tx;
+        this.py = ty;
+      }
+
+      update() {
+        const fx = (this.px - this.x) * STIFFNESS;
+        const fy = (this.py - this.y) * STIFFNESS;
+        
+        this.vx = (this.vx + fx / this.mass) * DAMPING;
+        this.vy = (this.vy + fy / this.mass) * DAMPING;
+        
+        this.x += this.vx;
+        this.y += this.vy;
+      }
+    }
+
+    class Particle {
+      constructor(x, y, color, speedAmp) {
+        this.x = x;
+        this.y = y;
+        this.vx = (Math.random() - 0.5) * speedAmp * 0.3;
+        this.vy = (Math.random() - 0.5) * speedAmp * 0.3 + Math.random() * 2;
+        this.life = 1.0;
+        this.decay = Math.random() * 0.04 + 0.02;
+        this.color = color;
+        this.size = Math.random() * 2 + 1;
+      }
+
+      update() {
+        this.vy += 0.1;
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= this.decay;
+      }
+
+      draw(ctx) {
+        ctx.globalAlpha = Math.max(0, this.life);
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+      }
+    }
+
+    const handsData = new Map();
+    let particles = [];
+    let detectedCurrentFrame = false;
+
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [0, 9], [9, 10], [10, 11], [11, 12],
+      [0, 13], [13, 14], [14, 15], [15, 16],
+      [0, 17], [17, 18], [18, 19], [19, 20]
+    ];
+
+    function processHands(results) {
+      detectedCurrentFrame = !!(results.multiHandLandmarks && results.multiHandLandmarks.length > 0);
+      if (detectedCurrentFrame) {
+        statusText.innerText = "Tracking active!";
+      } else {
+        statusText.innerText = "No hands detected. Show your hands.";
+      }
+
+      if (!results.multiHandLandmarks) return;
+
+      const currentIds = new Set();
+      
+      results.multiHandLandmarks.forEach((landmarks, index) => {
+        const id = index;
+        currentIds.add(id);
+
+        if (!handsData.has(id)) {
+          const pointsMap = new Map();
+          for(let i=0; i<21; i++) {
+             pointsMap.set(i, new PhysicsPoint(landmarks[i].x * cw, landmarks[i].y * ch));
+          }
+
+          handsData.set(id, {
+            points: pointsMap,
+            color: NEON_COLORS[id % NEON_COLORS.length],
+            isPinching: false,
+            lastPinchX: 0,
+            lastPinchY: 0
+          });
+        }
+        
+        const hd = handsData.get(id);
+        
+        for(let i=0; i<21; i++) {
+           const lm = landmarks[i];
+           hd.points.get(i).updateTarget(lm.x * cw, lm.y * ch);
+        }
+      });
+
+      for (let id of handsData.keys()) {
+        if (!currentIds.has(id)) {
+          handsData.delete(id);
+        }
+      }
+    }
+
+    function animate() {
+      // Background Trail Canvas
+      canvasCtx.globalCompositeOperation = 'source-over';
+      canvasCtx.fillStyle = 'rgba(5, 5, 5, 0.4)';
+      canvasCtx.fillRect(0, 0, cw, ch);
+      
+      canvasCtx.globalCompositeOperation = 'lighter';
+      paintCtx.globalCompositeOperation = 'lighter'; // Neon Overlay
+
+      handsData.forEach(hd => {
+        for(let i=0; i<21; i++) {
+           hd.points.get(i).update();
+        }
+
+        // --- Adaptive Scaling Pinch-to-Write Mechanism ---
+        const getDist = (idxA, idxB) => {
+            const pA = hd.points.get(idxA);
+            const pB = hd.points.get(idxB);
+            return Math.hypot(pA.x - pB.x, pA.y - pB.y);
+        };
+        
+        // Use wrist(0) to index base(5) as a stable hand ruler
+        const handRuler = getDist(0, 5); 
+        // Measure thumb(4) to index(8) pinch
+        const pinchDist = getDist(4, 8);
+        
+        // Pinch activates if distance is less than 60% of the hand ruler
+        // This solves all distance-scaling issues perfectly.
+        const isDrawingProperty = pinchDist < handRuler * 0.6;
+
+        const indexPt = hd.points.get(8);
+        
+        // --- HOVER CURSOR ---
+        // Always show the user exactly where the pen is so they can write legibly
+        canvasCtx.fillStyle = isDrawingProperty ? '#ffffff' : hd.color;
+        canvasCtx.shadowBlur = isDrawingProperty ? 30 : 15;
+        canvasCtx.shadowColor = hd.color;
+        canvasCtx.beginPath();
+        canvasCtx.arc(indexPt.x, indexPt.y, isDrawingProperty ? 12 : 6, 0, Math.PI * 2);
+        canvasCtx.fill();
+        canvasCtx.shadowBlur = 0;
+        
+        if (isDrawingProperty) {
+            // Smooth exponential interpolation (0.45 is a great balance of smooth and responsive)
+            if (!hd.inkX) { hd.inkX = indexPt.x; hd.inkY = indexPt.y; }
+            hd.inkX += (indexPt.x - hd.inkX) * 0.45;
+            hd.inkY += (indexPt.y - hd.inkY) * 0.45;
+
+            // Draw line into permanent ink layer
+            if (hd.wasDrawing) { 
+                paintCtx.beginPath();
+                paintCtx.moveTo(hd.lastDrawX, hd.lastDrawY);
+                paintCtx.lineTo(hd.inkX, hd.inkY);
+                paintCtx.lineCap = 'round';
+                
+                // Solid center white ink
+                paintCtx.strokeStyle = '#ffffff';
+                paintCtx.lineWidth = 3;
+                paintCtx.shadowBlur = 5;
+                paintCtx.shadowColor = '#ffffff';
+                paintCtx.stroke();
+                
+                // Bloom colored edge
+                paintCtx.strokeStyle = hd.color;
+                paintCtx.lineWidth = 10;
+                paintCtx.shadowBlur = 25;
+                paintCtx.shadowColor = hd.color;
+                paintCtx.stroke();
+            }
+            
+            hd.wasDrawing = true;
+            hd.lastDrawX = hd.inkX;
+            hd.lastDrawY = hd.inkY;
+        } else {
+            // Pen is hovering. Do not trace lines!
+            hd.wasDrawing = false;
+            hd.inkX = null;
+            hd.inkY = null;
+        }
+
+
+        // --- Optimized Skeleton Rendering ---
+        canvasCtx.beginPath(); // Start ONE single path for the entire skeleton!
+        canvasCtx.strokeStyle = hd.color;
+        canvasCtx.lineCap = 'round';
+        canvasCtx.lineJoin = 'round';
+        
+        HAND_CONNECTIONS.forEach(([startIdx, endIdx]) => {
+            const startPt = hd.points.get(startIdx);
+            const endPt = hd.points.get(endIdx);
+            
+            const dx = endPt.x - startPt.x;
+            const dy = endPt.y - startPt.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            
+            // Fast velocity proxy
+            const velocitySum = Math.abs(startPt.vx) + Math.abs(startPt.vy) + Math.abs(endPt.vx) + Math.abs(endPt.vy);
+            const isStretched = dist > Math.min(cw, ch) * 0.10; 
+
+            let sxDraw = startPt.x; let syDraw = startPt.y;
+            let exDraw = endPt.x;   let eyDraw = endPt.y;
+
+            if (isStretched) {
+               const tensionVibration = (dist * 0.05);
+               sxDraw += (Math.random() - 0.5) * tensionVibration;
+               syDraw += (Math.random() - 0.5) * tensionVibration;
+               exDraw += (Math.random() - 0.5) * tensionVibration;
+               eyDraw += (Math.random() - 0.5) * tensionVibration;
+            }
+
+            if (velocitySum > 10 || isStretched) {
+               // Greatly reduced particle count for processor health
+               if(Math.random() > 0.95) { 
+                   const lerp = Math.random(); 
+                   const px = sxDraw + dx * lerp;
+                   const py = syDraw + dy * lerp;
+                   particles.push(new Particle(px, py, hd.color, velocitySum));
+               }
+            }
+
+            canvasCtx.moveTo(sxDraw, syDraw);
+            canvasCtx.lineTo(exDraw, eyDraw);
+        });
+        
+        // Massive Performance Save: 1 stroke instead of 60! No shadowBlur on skeleton!
+        canvasCtx.lineWidth = 6;
+        canvasCtx.globalAlpha = 0.5;
+        canvasCtx.stroke();
+        
+        canvasCtx.lineWidth = 2;
+        canvasCtx.strokeStyle = '#ffffff';
+        canvasCtx.globalAlpha = 0.8;
+        canvasCtx.stroke();
+        canvasCtx.globalAlpha = 1.0;
+
+        canvasCtx.fillStyle = '#ffffff';
+        canvasCtx.shadowBlur = 0; 
+        
+        for(let i=0; i<21; i++) {
+           const pt = hd.points.get(i);
+           canvasCtx.beginPath();
+           const isTip = [4, 8, 12, 16, 20].includes(i);
+           canvasCtx.arc(pt.x, pt.y, isTip ? 4 : 2, 0, Math.PI * 2);
+           canvasCtx.fill();
+        }
+      });
+
+      // --- CAT'S CRADLE: INTER-HAND ENERGY BRIDGES ---
+      if (handsData.size === 2) {
+          const handsArray = Array.from(handsData.values());
+          const h1 = handsArray[0];
+          const h2 = handsArray[1];
+          
+          const fingertips = [4, 8, 12, 16, 20];
+          
+          canvasCtx.save();
+          // Flowing data stream line animation
+          canvasCtx.setLineDash([15, 20]);
+          canvasCtx.lineDashOffset = -performance.now() * 0.05; 
+          
+          canvasCtx.beginPath();
+          
+          fingertips.forEach(idx => {
+              const pt1 = h1.points.get(idx);
+              const pt2 = h2.points.get(idx);
+              
+              const dist = Math.hypot(pt2.x - pt1.x, pt2.y - pt1.y);
+              
+              let sx = pt1.x; let sy = pt1.y;
+              let ex = pt2.x; let ey = pt2.y;
+              
+              // Intense energy vibration when hands are pulled apart
+              if (dist > Math.min(cw, ch) * 0.25) {
+                  const vibe = dist * 0.03;
+                  sx += (Math.random() - 0.5) * vibe;
+                  sy += (Math.random() - 0.5) * vibe;
+                  ex += (Math.random() - 0.5) * vibe;
+                  ey += (Math.random() - 0.5) * vibe;
+              }
+              
+              canvasCtx.moveTo(sx, sy);
+              canvasCtx.lineTo(ex, ey);
+          });
+          
+          // Core bright dashed string
+          canvasCtx.lineWidth = 3;
+          canvasCtx.strokeStyle = '#ffffff';
+          canvasCtx.globalAlpha = 0.8;
+          canvasCtx.stroke();
+          
+          // Wide energetic plasma casing bridging both hands colors
+          canvasCtx.setLineDash([]); // solid glow
+          canvasCtx.lineWidth = 8;
+          canvasCtx.strokeStyle = h2.color; 
+          canvasCtx.globalAlpha = 0.3;
+          canvasCtx.stroke();
+          
+          canvasCtx.restore();
+      }
+
+      particles = particles.filter(p => {
+        p.update();
+        p.draw(canvasCtx);
+        return p.life > 0;
+      });
+
+      requestAnimationFrame(animate);
+    }
+
+    animate();
+
+    const hands = new Hands({locateFile: (file) => {
+      return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 0, 
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(processHands);
+
+    const camera = new Camera(videoElement, {
+      onFrame: async () => {
+        await hands.send({image: videoElement});
+      },
+      width: 1280,
+      height: 720
+    });
+
+    camera.start().then(() => {
+        statusText.innerText = "Camera active. Waiting for hands to appear...";
+
+        // Fade out texts and UI background after 10 seconds
+        setTimeout(() => {
+            const h1 = document.querySelector('#ui h1');
+            const ui = document.getElementById('ui');
+            
+            if (h1) { h1.style.transition = 'opacity 2s ease'; h1.style.opacity = '0'; }
+            if (statusText) { statusText.style.transition = 'opacity 2s ease'; statusText.style.opacity = '0'; }
+            if (ui) { 
+                ui.style.transition = 'background 2s ease, border 2s ease'; 
+                ui.style.background = 'transparent'; 
+                ui.style.border = 'none'; 
+            }
+        }, 10000);
+
+    }).catch(e => {
+        statusText.innerText = "Error starting camera. Have you allowed camera permissions?";
+        console.error(e);
+    });
+
+  </script>
+</body>
+</html>
